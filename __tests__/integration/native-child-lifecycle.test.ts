@@ -78,7 +78,6 @@ interface ChildHarnessOptions {
     baseDelayMs?: number;
     maxDelayMs?: number;
     multiplier?: number;
-    maxRetriesAtMaxDelay?: number;
     messageFreeRetries?: boolean;
   };
   /** Public custom tool definitions enabled for the session. */
@@ -89,7 +88,6 @@ interface ChildHarnessOptions {
   mode?: "print" | "json" | "rpc";
   /** Top-level policy fields that override the harness defaults. */
   mainRetryConfig?: {
-    maxRetriesAtMaxDelay?: number;
     messageFreeRetries?: boolean;
   };
 }
@@ -129,7 +127,6 @@ async function createChildHarness(
     baseDelayMs,
     maxDelayMs: baseDelayMs,
     multiplier: 1,
-    maxRetriesAtMaxDelay: 2,
     ...childRetryConfig,
     ...(configuredMatch === undefined || configuredMatch === null
       ? {}
@@ -139,7 +136,6 @@ async function createChildHarness(
     baseDelayMs,
     maxDelayMs: baseDelayMs,
     multiplier: 1,
-    maxRetriesAtMaxDelay: 2,
     ...(options.mainRetryConfig ?? {}),
     ...(Object.keys(subagents).length > 0 ? { subagents } : {}),
   };
@@ -657,26 +653,26 @@ describe("prompt-scoped ordinary sessions", () => {
   });
 
   // Unmatched sessions keep the top-level policy; child overrides apply only to matches.
+  // The child policy here asks for message-free retries, so a visible retry
+  // trigger proves the unmatched session ran on the top-level policy instead.
   it("applies the top-level policy, not child overrides, to unmatched sessions", async () => {
     const harness = await createChildHarness(
       [
         fauxAssistantMessage("error one", { stopReason: "error", errorMessage: "connection error one" }),
-        fauxAssistantMessage("error two", { stopReason: "error", errorMessage: "connection error two" }),
-        fauxAssistantMessage("unexpected third request"),
+        fauxAssistantMessage("recovered in unmatched session"),
       ],
       1,
       {
         childMarker: false,
-        mainRetryConfig: { maxRetriesAtMaxDelay: 1 },
-        childRetryConfig: { maxRetriesAtMaxDelay: 5 },
+        childRetryConfig: { messageFreeRetries: true },
       },
     );
     try {
-      await harness.session.prompt("Stop after the top-level retry cap.");
+      await harness.session.prompt("Recover using the top-level policy.");
 
-      // The initial request plus exactly one capped retry are delivered.
       expect(harness.faux.state.callCount).toBe(2);
-      expect(harness.faux.getPendingResponseCount()).toBe(1);
+      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(1);
+      expect(harness.session.getLastAssistantText()).toBe("recovered in unmatched session");
     } finally {
       await harness.close();
     }
@@ -883,25 +879,23 @@ describe("message-free retries", () => {
     }
   });
 
-  it("stops message-free retries at the configured cap", async () => {
+  it("retries message-free errors without a failure cap", async () => {
     const harness = await createChildHarness(
       [
         fauxAssistantMessage("error one", { stopReason: "error", errorMessage: "connection error one" }),
         fauxAssistantMessage("error two", { stopReason: "error", errorMessage: "connection error two" }),
         fauxAssistantMessage("error three", { stopReason: "error", errorMessage: "connection error three" }),
-        fauxAssistantMessage("unexpected fourth request"),
+        fauxAssistantMessage("recovered after three message-free retries"),
       ],
       1,
-      { childRetryConfig: { baseDelayMs: 1, maxDelayMs: 1, maxRetriesAtMaxDelay: 2, messageFreeRetries: true } },
+      { childRetryConfig: { baseDelayMs: 1, maxDelayMs: 1, messageFreeRetries: true } },
     );
     try {
-      await harness.session.prompt("Stop after the configured retry cap.");
+      await harness.session.prompt("Recover after repeated failures.");
 
-      expect(harness.faux.state.callCount).toBe(3);
-      expect(harness.faux.getPendingResponseCount()).toBe(1);
+      expect(harness.faux.state.callCount).toBe(4);
       expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(0);
-      // The final failure is reported, not omitted.
-      expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "error" });
+      expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
     } finally {
       await harness.close();
     }
@@ -1081,8 +1075,8 @@ describe("native child retry risk coverage", () => {
     }
   });
 
-  // TEST:__tests__/integration/native-child-lifecycle.test.ts[retry cap]
-  it("exhausts repeated child errors exactly at the configured cap", async () => {
+  // TEST:__tests__/integration/native-child-lifecycle.test.ts[uncapped child retries]
+  it("retries repeated child errors until one succeeds", async () => {
     const harness = await createChildHarness(
       [
         fauxAssistantMessage("error one", {
@@ -1097,50 +1091,48 @@ describe("native child retry risk coverage", () => {
           stopReason: "error",
           errorMessage: "connection error three",
         }),
-        fauxAssistantMessage("unexpected fourth request"),
+        fauxAssistantMessage("recovered after three child retries"),
       ],
       1,
-      { childRetryConfig: { baseDelayMs: 1, maxDelayMs: 1, maxRetriesAtMaxDelay: 2 } },
+      { childRetryConfig: { baseDelayMs: 1, maxDelayMs: 1 } },
     );
     try {
-      await harness.session.prompt("Stop after the configured child retry cap.");
+      await harness.session.prompt("Recover after repeated failures.");
 
-      // The initial request plus exactly two capped retries are delivered; the
-      // fourth scripted response remains untouched.
-      expect(harness.faux.state.callCount).toBe(3);
-      expect(harness.faux.getPendingResponseCount()).toBe(1);
-      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(2);
+      // Every failure gets its own retry trigger; there is no failure cap.
+      expect(harness.faux.state.callCount).toBe(4);
+      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(3);
+      expect(harness.session.getLastAssistantText()).toBe("recovered after three child retries");
     } finally {
       await harness.close();
     }
   });
 
-  // TEST:__tests__/integration/native-child-lifecycle.test.ts[manual retry after cap]
-  it("lets a manual child retry start again after the automatic cap", async () => {
+  // TEST:__tests__/integration/native-child-lifecycle.test.ts[manual child retry]
+  it("lets a manual child retry start again after the user aborted the loop", async () => {
     const harness = await createChildHarness(
       [
         fauxAssistantMessage("initial error", {
           stopReason: "error",
           errorMessage: "connection error before manual retry",
         }),
-        fauxAssistantMessage("automatic retry error", {
-          stopReason: "error",
-          errorMessage: "connection error at manual retry cap",
-        }),
         fauxAssistantMessage("manual retry recovered"),
       ],
-      1,
-      { childRetryConfig: { baseDelayMs: 1, maxDelayMs: 1, maxRetriesAtMaxDelay: 1 } },
+      250,
+      { childRetryConfig: { baseDelayMs: 250, maxDelayMs: 250 } },
     );
     try {
-      await harness.session.prompt("Reach the child retry cap.");
-      expect(harness.faux.state.callCount).toBe(2);
+      const promptPromise = harness.session.prompt("Abort, then retry manually.");
+      await harness.waitForFirstError();
+      await harness.session.abort();
+      await promptPromise;
+      expect(harness.faux.state.callCount).toBe(1);
 
-      // The command must reset the exhausted lifecycle before queueing a new turn.
+      // The command must reset the cancelled lifecycle before queueing a new turn.
       await harness.session.prompt("/retry");
-      await new Promise(resolve => setTimeout(resolve, 20));
+      await new Promise(resolve => setTimeout(resolve, 400));
 
-      expect(harness.faux.state.callCount).toBe(3);
+      expect(harness.faux.state.callCount).toBe(2);
       expect(harness.faux.getPendingResponseCount()).toBe(0);
       expect(harness.session.messages.at(-1)).toMatchObject({
         role: "assistant",
@@ -1151,8 +1143,8 @@ describe("native child retry risk coverage", () => {
     }
   });
 
-  // TEST:__tests__/integration/native-child-lifecycle.test.ts[subsequent quota classification]
-  it("rechecks quota classification after a transient child error", async () => {
+  // TEST:__tests__/integration/native-child-lifecycle.test.ts[quota exhaustion is retried]
+  it("retries quota exhaustion after a transient child error", async () => {
     const harness = await createChildHarness(
       [
         fauxAssistantMessage("transient error", {
@@ -1163,45 +1155,47 @@ describe("native child retry risk coverage", () => {
           stopReason: "error",
           errorMessage: "You've hit your usage limit; it resets tomorrow",
         }),
-        fauxAssistantMessage("must not retry quota exhaustion"),
+        fauxAssistantMessage("recovered after the quota window reset"),
       ],
       0,
       { childRetryConfig: { baseDelayMs: 0, maxDelayMs: 0 } },
     );
     try {
-      await harness.session.prompt("Stop when the provider reports quota exhaustion.");
+      await harness.session.prompt("Keep retrying quota exhaustion.");
 
-      expect(harness.faux.state.callCount).toBe(2);
-      expect(harness.faux.getPendingResponseCount()).toBe(1);
-      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(1);
+      expect(harness.faux.state.callCount).toBe(3);
+      expect(harness.faux.getPendingResponseCount()).toBe(0);
+      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(2);
+      expect(harness.session.getLastAssistantText()).toBe("recovered after the quota window reset");
     } finally {
       await harness.close();
     }
   });
 
-  // TEST:__tests__/integration/native-child-lifecycle.test.ts[subsequent permanent classification]
-  it("rechecks permanent classification after a transient child error", async () => {
+  // TEST:__tests__/integration/native-child-lifecycle.test.ts[invalid api key is retried]
+  it("retries an invalid API key after a transient child error", async () => {
     const harness = await createChildHarness(
       [
         fauxAssistantMessage("transient error", {
           stopReason: "error",
-          errorMessage: "connection error before the permanent response",
+          errorMessage: "connection error before the authentication response",
         }),
-        fauxAssistantMessage("permanent authentication error", {
+        fauxAssistantMessage("authentication error", {
           stopReason: "error",
           errorMessage: "invalid API key provided by the provider",
         }),
-        fauxAssistantMessage("must not retry permanent errors"),
+        fauxAssistantMessage("recovered after the key was refreshed"),
       ],
       0,
       { childRetryConfig: { baseDelayMs: 0, maxDelayMs: 0 } },
     );
     try {
-      await harness.session.prompt("Stop when authentication becomes invalid.");
+      await harness.session.prompt("Keep retrying invalid api key errors.");
 
-      expect(harness.faux.state.callCount).toBe(2);
-      expect(harness.faux.getPendingResponseCount()).toBe(1);
-      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(1);
+      expect(harness.faux.state.callCount).toBe(3);
+      expect(harness.faux.getPendingResponseCount()).toBe(0);
+      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(2);
+      expect(harness.session.getLastAssistantText()).toBe("recovered after the key was refreshed");
     } finally {
       await harness.close();
     }
@@ -1334,8 +1328,8 @@ describe("native child retry risk coverage", () => {
     }
   });
 
-  // TEST:__tests__/integration/native-child-lifecycle.test.ts[overflow compaction deferral]
-  it("defers overflow to SDK compaction instead of child retry", async () => {
+  // TEST:__tests__/integration/native-child-lifecycle.test.ts[overflow is retried]
+  it("retries a context overflow like any other error", async () => {
     const setupTool = defineTool({
       name: "setup_overflow_context",
       label: "Setup Overflow Context",
@@ -1358,29 +1352,23 @@ describe("native child retry risk coverage", () => {
           stopReason: "error",
           errorMessage: "prompt is too long: 213462 tokens > 200000 maximum",
         }),
-        fauxAssistantMessage("recovered after SDK compaction"),
+        fauxAssistantMessage("recovered after the overflow retry"),
       ],
       0,
       {
         contextWindow: 128_000,
         customTools: [setupTool],
         tools: ["setup_overflow_context"],
-        compaction: { enabled: true, reserveTokens: 0, keepRecentTokens: 0 },
       },
     );
     try {
-      await harness.session.prompt("Build enough context to exercise overflow compaction.");
+      await harness.session.prompt("Build enough context to exercise overflow retries.");
 
+      // Compaction is off, so the only recovery path is pi-retry's own trigger.
       expect(harness.faux.state.callCount).toBe(3);
       expect(harness.faux.getPendingResponseCount()).toBe(0);
-      expect(harness.compactionEvents).toHaveLength(1);
-      expect(harness.session.messages.some(message =>
-        message.role === "compactionSummary" &&
-        message.summary === "deterministic compacted child context",
-      )).toBe(true);
-      // The overflow is handled by the SDK compaction path, so pi-retry adds
-      // no custom retry trigger for this response.
-      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(0);
+      expect(harness.compactionEvents).toHaveLength(0);
+      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(1);
     } finally {
       await harness.close();
     }

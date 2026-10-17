@@ -69,7 +69,6 @@ describe("resolvePiRetrySettings", () => {
       baseDelayMs: 25,
       maxDelayMs: 500,
       multiplier: 2,
-      maxRetriesAtMaxDelay: 3,
       messageFreeRetries: false,
     });
     expect(settings.subagents).toEqual({
@@ -121,7 +120,6 @@ describe("resolvePiRetrySettings", () => {
       {
         piRetry: {
           maxDelayMs: 200,
-          maxRetriesAtMaxDelay: 7,
           subagents: { maxDelayMs: 33 },
         },
       },
@@ -131,7 +129,6 @@ describe("resolvePiRetrySettings", () => {
       baseDelayMs: 10,
       maxDelayMs: 200,
       multiplier: 2,
-      maxRetriesAtMaxDelay: 7,
       messageFreeRetries: false,
     });
     expect(settings.subagents).toEqual({
@@ -139,7 +136,6 @@ describe("resolvePiRetrySettings", () => {
       baseDelayMs: 3,
       maxDelayMs: 33,
       multiplier: 1.25,
-      maxRetriesAtMaxDelay: 7,
       messageFreeRetries: false,
       match: { systemPromptRegex: [] },
     });
@@ -157,7 +153,6 @@ describe("resolvePiRetrySettings", () => {
             baseDelayMs: -1,
             maxDelayMs: "large",
             multiplier: 0,
-            maxRetriesAtMaxDelay: 1.5,
           },
         },
       },
@@ -168,7 +163,7 @@ describe("resolvePiRetrySettings", () => {
       ...DEFAULT_RETRY_CONFIG,
       match: { systemPromptRegex: [] },
     });
-    expect(warning).toHaveBeenCalledTimes(5);
+    expect(warning).toHaveBeenCalledTimes(4);
   });
 
   // Boolean shorthand is invalid; only an object with enabled:false disables.
@@ -334,7 +329,7 @@ describe("resolvePiRetryConfig", () => {
       },
       {
         piRetry: {
-          maxRetriesAtMaxDelay: 3,
+          multiplier: 3,
         },
       },
     );
@@ -342,8 +337,7 @@ describe("resolvePiRetryConfig", () => {
     expect(config).toEqual({
       baseDelayMs: 10_000,
       maxDelayMs: 3_600_000,
-      multiplier: 2,
-      maxRetriesAtMaxDelay: 3,
+      multiplier: 3,
       messageFreeRetries: false,
     });
   });
@@ -357,14 +351,13 @@ describe("resolvePiRetryConfig", () => {
           baseDelayMs: -1,
           maxDelayMs: "one hour",
           multiplier: 0,
-          maxRetriesAtMaxDelay: 1.5,
         },
       },
       {},
     );
 
     expect(config).toEqual(DEFAULT_RETRY_CONFIG);
-    expect(warning).toHaveBeenCalledTimes(4);
+    expect(warning).toHaveBeenCalledTimes(3);
   });
 });
 
@@ -375,14 +368,13 @@ describe("loadPiRetryConfig", () => {
       piRetry: { baseDelayMs: 10_000, maxDelayMs: 3_600_000 },
     });
     writeSettings("project", root, home, {
-      piRetry: { maxRetriesAtMaxDelay: 3 },
+      piRetry: { multiplier: 3 },
     });
 
     expect(loadPiRetryConfig(root, home)).toEqual({
       baseDelayMs: 10_000,
       maxDelayMs: 3_600_000,
-      multiplier: 2,
-      maxRetriesAtMaxDelay: 3,
+      multiplier: 3,
       messageFreeRetries: false,
     });
   });

@@ -195,9 +195,10 @@ describe("reported retry regressions", () => {
     }
   });
 
-  // The ordinary driver already owns a completed loop before manual retry starts.
-  // TEST:__tests__/unit/user-retry-regression.test.ts[manual retry after ordinary cap]
-  it("allows manual retry after the ordinary retry cap", async () => {
+  // The ordinary loop is uncapped: it keeps going past the old max-delay cut-off
+  // and owns the mutex, so a manual /retry must not schedule a second loop.
+  // TEST:__tests__/unit/user-retry-regression.test.ts[uncapped retry loop]
+  it("keeps retrying past the old cap and ignores manual retry while looping", async () => {
     const { commands, handlers, manager, ctx, restore } = await setup();
     try {
       const agent = attachAgent(manager, currentAgent => {
@@ -210,12 +211,18 @@ describe("reported retry regressions", () => {
         void handler({ messages: [] }, ctx);
       }
       await advance(250_000);
-      const attemptsBeforeManual = agent.prompt.mock.calls.length;
+      const attemptsAtOldCap = agent.prompt.mock.calls.length;
 
+      // No cap: three more 60s attempts fit in this window.
+      await advance(200_000);
+      const attemptsAfterCap = agent.prompt.mock.calls.length;
+      expect(attemptsAfterCap).toBeGreaterThan(attemptsAtOldCap);
+
+      // The running loop already owns the retry mutex, so /retry adds no turn.
       await commands["retry"]!.handler([], ctx);
       await advance(3_000);
 
-      expect(agent.prompt.mock.calls.length).toBe(attemptsBeforeManual + 1);
+      expect(agent.prompt.mock.calls.length).toBe(attemptsAfterCap);
     } finally {
       restore();
     }

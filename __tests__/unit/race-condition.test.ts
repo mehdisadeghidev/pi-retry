@@ -486,43 +486,8 @@ describe("infinite retry loop", () => {
 
 // ── Context overflow defers to compaction (does NOT retry in place) ──
 
-describe("context overflow defers to compaction", () => {
-  it("does not request a hidden turn for an overflow error", async () => {
-    const { handlers, agent, restore } = await setup();
-    try {
-      const entries = [errorEntry("prompt is too long: 213462 tokens > 200000 maximum")];
-      fireAgentEndAsync(handlers, entries);
-
-      // Far beyond any backoff — a retry request would have fired by now.
-      await advanceThroughRetry(70000);
-
-      expect(agent.prompt).not.toHaveBeenCalled();
-    } finally {
-      restore();
-    }
-  });
-
-  it("notifies that it is deferring to compaction", async () => {
-    const { handlers, restore } = await setup();
-    try {
-      const entries = [errorEntry("Your input exceeds the context window of this model")];
-      const ctx = createMockCtx(entries);
-      const fns = handlers["agent_end"] ?? [];
-      for (const fn of fns) {
-        await fn({ messages: [] }, ctx);
-      }
-
-      expect(ctx.ui.notify).toHaveBeenCalled();
-      const messages = ctx.ui.notify.mock.calls.map((c: any) => c[0] as string);
-      expect(messages.some((m: string) => /Context overflow/i.test(m))).toBe(true);
-    } finally {
-      restore();
-    }
-  });
-
-  it("does NOT set the retry mutex (pi-core's compaction-continue stays unblocked)", async () => {
-    // After deferring, a subsequent retryable (non-overflow) error must still
-    // be able to request a hidden turn, so the mutex was not left held.
+describe("context overflow is retried too", () => {
+  it("requests a hidden turn for an overflow error", async () => {
     const { handlers, agent, restore } = await setup({
       prompt: vi.fn().mockImplementation(() => {
         agent.state.messages = [
@@ -532,15 +497,31 @@ describe("context overflow defers to compaction", () => {
       }),
     });
     try {
-      // First: overflow → defer (no prompt, mutex not held)
-      fireAgentEndAsync(handlers, [errorEntry("prompt is too long: 213462 > 200000")]);
-      await advanceThroughRetry(3000);
-      expect(agent.prompt).not.toHaveBeenCalled();
+      fireAgentEndAsync(handlers, [
+        errorEntry("prompt is too long: 213462 tokens > 200000 maximum"),
+      ]);
 
-      // Then: a connection error → should retry normally
-      fireAgentEndAsync(handlers, [errorEntry("Connection error")]);
-      await advanceThroughRetry(3000);
-      expect(agent.prompt).toHaveBeenCalledWith([]);
+      // Far beyond any backoff — a retry request would have fired by now.
+      await advanceThroughRetry(70000);
+
+      expect(agent.prompt).toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+
+  it("does not notify that it is deferring to compaction", async () => {
+    const { handlers, restore } = await setup();
+    try {
+      const entries = [errorEntry("Your input exceeds the context window of this model")];
+      const ctx = createMockCtx(entries);
+      const fns = handlers["agent_end"] ?? [];
+      for (const fn of fns) {
+        await fn({ messages: [] }, ctx);
+      }
+
+      const messages = ctx.ui.notify.mock.calls.map((c: any) => c[0] as string);
+      expect(messages.some((m: string) => /Context overflow|compaction/i.test(m))).toBe(false);
     } finally {
       restore();
     }

@@ -11,12 +11,8 @@ import {
   getLastAssistantMessage,
   hasEmptyStop,
   hasMaxTokensStop,
-  hasQuotaExhaustedError,
   hasRetryableError,
   isAssistantMessage,
-  isContextOverflowError,
-  isNonRetryableError,
-  isSilencedError,
   RETRY_TRIGGER_CUSTOM_TYPE,
 } from "./error-patterns.js";
 import {
@@ -74,8 +70,6 @@ export class ChildRetryController {
   private readonly continuationState = new ContinuationState();
   /** Empty-stop continuation counter, bounded to one nudge. */
   private emptyNudges = 0;
-  /** Number of ordinary attempts whose delay reached the configured cap. */
-  private maxDelayRetries = 0;
   /** Number of ordinary retry turns scheduled from this original prompt. */
   private retryAttempt = 0;
   /** Prevents duplicate scheduling if an event and manual command race. */
@@ -132,15 +126,6 @@ export class ChildRetryController {
     if (!lastAssistant || !isAssistantMessage(lastAssistant)) return;
     if (this.driving) return;
 
-    // Compaction owns context overflow. The child controller must not queue a
-    // same-context retry that races the SDK's compaction recovery.
-    if (isContextOverflowError(lastAssistant)) {
-      this.notify(ctx, "Context overflow - deferring to compaction.", "info");
-      this.resetCounters();
-      this.finishLifecycle(false);
-      return;
-    }
-
     if (hasMaxTokensStop(lastAssistant)) {
       if (this.continuationState.getIsContinuing()) return;
       this.continuationState.startContinuation();
@@ -170,24 +155,8 @@ export class ChildRetryController {
       return;
     }
 
-    // Re-evaluate permanent and quota errors for every attempt, including a
-    // provider that changes its error category after a transient failure.
-    if (isNonRetryableError(lastAssistant)) {
-      const errorMsg = lastAssistant.errorMessage || "Unknown error";
-      if (!isSilencedError(lastAssistant)) {
-        this.notify(
-          ctx,
-          hasQuotaExhaustedError(lastAssistant)
-            ? `Quota/limit exhausted - not retrying: ${errorMsg.substring(0, 100)}`
-            : `Non-retryable error (not retried): ${errorMsg.substring(0, 100)}`,
-          "warning",
-        );
-      }
-      this.resetCounters();
-      this.finishLifecycle(false);
-      return;
-    }
-
+    // Every error is retryable — invalid API keys, missing models,
+    // quota/budget exhaustion and context overflow included.
     if (!hasRetryableError(lastAssistant)) return;
 
     const errorMsg = lastAssistant.errorMessage || "Unknown error";
@@ -291,7 +260,6 @@ export class ChildRetryController {
     for (const state of Object.values(this.states)) state.reset();
     this.continuationState.reset();
     this.emptyNudges = 0;
-    this.maxDelayRetries = 0;
     this.retryAttempt = 0;
     this.finishLifecycle(false);
   }
@@ -359,21 +327,8 @@ export class ChildRetryController {
       if (kind === "retry") {
         this.retryAttempt++;
       }
-      if (kind === "retry" && this.maxDelayRetries >= this.config.maxRetriesAtMaxDelay) {
-        this.notify(
-          ctx,
-          `Retry failed ${this.config.maxRetriesAtMaxDelay} times at the maximum backoff; giving up.`,
-          "warning",
-        );
-        this.resetCounters();
-        this.finishLifecycle(false);
-        return;
-      }
       const attempt = kind === "retry" ? this.retryAttempt : this.retryAttempt + 1;
       const delay = calculateDelay(attempt, this.config);
-      if (kind === "retry" && delay >= this.config.maxDelayMs) {
-        this.maxDelayRetries++;
-      }
 
       // An automatic error retry can continue the active run without a message;
       // a manual retry starts from idle, where only a queued message can.
@@ -550,7 +505,6 @@ export class ChildRetryController {
     for (const state of Object.values(this.states)) state.succeed();
     this.continuationState.complete();
     this.emptyNudges = 0;
-    this.maxDelayRetries = 0;
     this.retryAttempt = 0;
   }
 

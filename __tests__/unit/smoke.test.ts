@@ -240,7 +240,7 @@ describe("smoke: full retry lifecycle", () => {
     }
   });
 
-  it("non-retryable error is not retried", async () => {
+  it("retries errors that used to be permanent", async () => {
     const { handlers, restore } = await setup();
     try {
       const agent = await createAgentWithMessages(
@@ -258,7 +258,7 @@ describe("smoke: full retry lifecycle", () => {
 
       await advance(10000);
 
-      expect(agent.prompt).not.toHaveBeenCalled();
+      expect(agent.prompt).toHaveBeenCalled();
     } finally {
       restore();
     }
@@ -534,13 +534,13 @@ describe("smoke: built-in retry exhaustion", () => {
 });
 
 describe("smoke: retry delay cutoff", () => {
-  it("stops after three failed retries at the maximum delay", async () => {
+  it("keeps retrying at the maximum delay without a failure cap", async () => {
     const { handlers, restore } = await setup();
     try {
       const agent = await createAgentWithMessages(
         [{ role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] }],
         vi.fn().mockImplementation(() => {
-          // Keep returning the same failure so the retry cutoff is exercised.
+          // Keep returning the same failure so the uncapped loop is exercised.
           agent.state.messages = [
             { role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] },
           ];
@@ -553,14 +553,13 @@ describe("smoke: retry delay cutoff", () => {
         void fn({ messages: [] }, ctx);
       }
 
-      // Default delays: 2s, 4s, 8s, 16s, 32s, then three 60s attempts.
-      await advance(250_000);
+      // Default delays: 2s, 4s, 8s, 16s, 32s, then 60s per attempt forever.
+      await advance(400_000);
 
-      expect(agent.prompt).toHaveBeenCalledTimes(8);
-      expect(ctx.ui.notify).toHaveBeenCalledWith(
-        expect.stringContaining("Retry failed 3 times at the maximum backoff"),
-        "warning",
-      );
+      // Delays inside the window: 2 + 4 + 8 + 16 + 32 + 5x60 = 362s of budget.
+      expect(agent.prompt.mock.calls.length).toBeGreaterThanOrEqual(10);
+      const messages = ctx.ui.notify.mock.calls.map((c: any) => c[0] as string);
+      expect(messages.some((m: string) => /giving up|Retry failed/i.test(m))).toBe(false);
     } finally {
       restore();
     }

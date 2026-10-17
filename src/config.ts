@@ -14,8 +14,6 @@ import {
  * Complete retry configuration used by the extension.
  */
 export interface PiRetryConfig extends BackoffConfig {
-  /** Number of failed retries allowed after the delay reaches maxDelayMs. */
-  maxRetriesAtMaxDelay: number;
   /**
    * Retry errors by omitting the failed response and continuing the same
    * request, instead of queueing a hidden retry message. Opt-in.
@@ -35,8 +33,6 @@ export interface PiRetrySubagentsOverride {
   maxDelayMs?: number;
   /** Child retry exponential multiplier. */
   multiplier?: number;
-  /** Failed child retries allowed at the maximum delay. */
-  maxRetriesAtMaxDelay?: number;
   /** Child override for message-free error retries. */
   messageFreeRetries?: boolean;
   /** Optional policy-selection rules for effective system prompts. */
@@ -80,7 +76,6 @@ export interface PiRetrySettings {
  */
 export const DEFAULT_RETRY_CONFIG: PiRetryConfig = {
   ...DEFAULT_BACKOFF_CONFIG,
-  maxRetriesAtMaxDelay: 3,
   messageFreeRetries: false,
 };
 
@@ -338,12 +333,6 @@ function resolveMainRetryConfig(
       DEFAULT_RETRY_CONFIG.multiplier,
       value => value >= 1,
     ),
-    maxRetriesAtMaxDelay: readNumberSetting(
-      mergedSettings,
-      "maxRetriesAtMaxDelay",
-      DEFAULT_RETRY_CONFIG.maxRetriesAtMaxDelay,
-      value => Number.isInteger(value) && value >= 1,
-    ),
     messageFreeRetries: readBooleanSetting(
       mergedSettings,
       "messageFreeRetries",
@@ -417,13 +406,6 @@ export function resolvePiRetrySettings(
         value => value >= 1,
         `${PI_RETRY_SETTINGS_KEY}.subagents.multiplier`,
       ),
-      maxRetriesAtMaxDelay: readNumberSetting(
-        mergedSubagents,
-        "maxRetriesAtMaxDelay",
-        main.maxRetriesAtMaxDelay,
-        value => Number.isInteger(value) && value >= 1,
-        `${PI_RETRY_SETTINGS_KEY}.subagents.maxRetriesAtMaxDelay`,
-      ),
       messageFreeRetries: readBooleanSetting(
         mergedSubagents,
         "messageFreeRetries",
@@ -494,6 +476,8 @@ export function loadPiRetryConfig(
  * @returns Decoded JSON contents, or an empty object when unavailable.
  */
 function readSettingsFile(filePath: string): unknown {
+  // SAFETY: contents come from an arbitrary user settings file, so the honest
+  // type is unknown; every caller validates through isSettingsObject first.
   try {
     return JSON.parse(readFileSync(filePath, "utf8")) as unknown;
   } catch (error) {

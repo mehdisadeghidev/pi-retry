@@ -25,15 +25,17 @@ Run `bun run test:host` for the offline real-host load, native codemode/nested-c
 
 ## Overview
 
-This extension automatically detects and retries **all** errors by default, with only a tiny blacklist of known permanent failures (invalid API key, missing model, etc.).
+This extension automatically detects and retries **all** errors, forever, until you abort. There is no error blacklist and no failure cap: invalid API keys, missing models, quota/budget exhaustion and context overflow are retried like a socket hiccup.
 
 | Error Type | Retry Behavior | Use Case |
 |------------|----------------|----------|
-| **Any retryable error** (catch-all) | **Capped exponential retry** | Everything else — provider hiccups, stream exhaustion, credit issues, unknown errors |
-| HTTP 400/413 | **Capped** with exponential backoff, NO compaction | Transient context overflow that might resolve |
-| Credit / payment errors | **Capped** with exponential backoff | "Not Enough Credits", insufficient balance, 402 — top up and the retry loop auto-resumes |
-| **Quota / session-limit / budget exhaustion** | **Not retried** — notify + stop | "You've hit your limit", `insufficient_quota`, "out of budget", suspended accounts |
-| Connection errors | **Capped** with exponential backoff | Network hiccups, connection drops, socket errors, stream exhaustion |
+| **Any error** (catch-all) | **Uncapped** exponential retry | Everything, including unknown errors |
+| HTTP 400/413 | **Uncapped** with exponential backoff | Transient context overflow that might resolve |
+| Credit / payment errors | **Uncapped** with exponential backoff | "Not Enough Credits", insufficient balance, 402 — top up and the retry loop auto-resumes |
+| **Quota / session-limit / budget exhaustion** | **Retried** — labelled in `/retry status` | "You've hit your limit", `insufficient_quota`, "out of budget", suspended accounts |
+| Invalid API key / unknown model | **Retried** — no exception | The key or model may be fixed mid-loop |
+| Context overflow | **Retried** alongside SDK compaction | Oversized payload; either path can recover the turn |
+| Connection errors | **Uncapped** with exponential backoff | Network hiccups, connection drops, socket errors, stream exhaustion |
 | Max tokens (`stopReason: "length"`) | **Auto-continue** indefinitely with hidden continuation turns | Model hits output token limit mid-generation |
 | Empty / think-only stop (`stopReason: "stop"` with no text or tool calls) | **Nudge once** with a hidden continuation, then give up | Model ends its turn with no usable output (Anthropic empty responses with end_turn, thinking-only turns) |
 
@@ -51,20 +53,18 @@ By default, pi has built-in retry for some errors (rate limits, 5xx, overloaded)
 
 ## The Solution
 
-This extension provides automatic retry for all errors with configurable exponential backoff and a maximum-delay failure limit (2s → 4s → 8s → ... → 60s by default).
+This extension provides automatic retry for all errors with configurable exponential backoff (2s → 4s → 8s → ... → 60s by default) and keeps retrying at the maximum delay forever.
 
-**Philosophy: retry EVERYTHING by default.** The only things we skip are a tiny blacklist of known permanent failures (invalid API key, model not found, unsupported model, etc.).
+**Philosophy: retry EVERYTHING, forever.** Nothing is excluded — not an invalid API key, not a missing model, not an exhausted quota. Only a user abort (ESC), fresh input, or a session change stops the loop.
 
 **Features:**
 - **Catch-all retry** — Any `stopReason: "error"` is retried, regardless of error message
 - Automatic detection of 400/413, connection, credit, and stream exhaustion errors
 - **Auto-continuation** when the model hits its max output tokens (`stopReason: "length"`) — indefinite, no cap, hidden from the TUI
-- **Retry cutoff** — Keeps retrying until success, abort, or the configured number of failures at the maximum delay
-- **Auto-stop on quota/budget exhaustion** — Session limits, plan quotas, and budget caps ("You've hit your limit", "out of budget", `insufficient_quota`, suspended accounts) are detected and **not** retried, with a notification explaining why
-- Exponential backoff with configurable base delay, cap, multiplier, and maximum-delay failure count
+- **No cutoff** — Keeps retrying at the maximum backoff until success, abort, or session change, with a notification explaining why
+- Exponential backoff with configurable base delay, cap, and multiplier
 - **Hidden triggers** — provider-valid custom messages use `display: false`, so retries do not add TUI clutter
 - Manual controls via unified `/retry` command
-- Non-retryable errors are explicitly logged so you know why we didn't retry
 
 ---
 
@@ -139,20 +139,18 @@ The extension reads a `piRetry` object from Pi's settings files:
   "piRetry": {
     "baseDelayMs": 10000,
     "maxDelayMs": 3600000,
-    "multiplier": 2,
-    "maxRetriesAtMaxDelay": 3
+    "multiplier": 2
   }
 }
 ```
 
-The example above waits 10 seconds before the first retry, doubles each delay, caps the delay at one hour, and stops after three failed retries at that cap. Supported values are:
+The example above waits 10 seconds before the first retry, doubles each delay, caps the delay at one hour, and keeps retrying at that cap until you abort. Supported values are:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `baseDelayMs` | `2000` | Delay before the first retry, in milliseconds |
 | `maxDelayMs` | `60000` | Maximum delay between retries, in milliseconds |
 | `multiplier` | `2` | Exponential backoff multiplier; must be at least `1` |
-| `maxRetriesAtMaxDelay` | `3` | Failed ordinary retries allowed after the delay reaches `maxDelayMs` |
 | `messageFreeRetries` | `false` | Retry errors without a hidden retry message (see below) |
 
 `piRetry` is separate from Pi's built-in `retry` object so the two retry policies do not share ambiguous settings. The extension disables Pi's native retry scheduler while it is loaded, while preserving Pi's compaction handling, so only one retry loop owns the backoff schedule.
@@ -184,12 +182,11 @@ the raw session history.
 
 1. **Listen to `agent_end` event** — Fires after each agent turn completes
 2. **Check for any error** — Examine the last assistant message for `stopReason === "error"`
-3. **Blacklist check** — Skip known permanent failures (invalid API key, model not found, quota/session-limit/budget exhaustion, suspended accounts, etc.)
-4. **Categorize for messaging** — Classify into 400/413, credit, connection, or other for nice UI notifications
-5. **Retry or continue with hidden turns** — Wait with exponential backoff, then trigger a provider-valid custom user turn via `pi.sendMessage()` with `display: false` and `triggerTurn: true` (with `messageFreeRetries`, error retries omit the failed response and continue instead)
-6. **Valid provider context** — Hidden retry and continuation messages remain in context so providers never receive a trailing assistant message
-7. **Indefinite continuation** — Max_tokens auto-continues are uncapped; repeated `length` stops keep producing continuation turns until the model terminates normally
-8. **Empty-stop recovery** — A `stop` turn with no usable output (only thinking, or nothing at all) gets exactly one hidden "nudge" continuation, then gives up. Matches Anthropic's documented "empty responses with `end_turn`" remedy (continuation prompt in a new user message) — retrying an empty response in place doesn't help because the model has already decided it's done.
+3. **Categorize for messaging** — Classify into 400/413, credit, connection, quota, or other for `/retry status` diagnostics (labelling only; it never gates retrying)
+4. **Retry or continue with hidden turns** — Wait with exponential backoff, then trigger a provider-valid custom user turn via `pi.sendMessage()` with `display: false` and `triggerTurn: true` (with `messageFreeRetries`, error retries omit the failed response and continue instead)
+5. **Valid provider context** — Hidden retry and continuation messages remain in context so providers never receive a trailing assistant message
+6. **Indefinite continuation** — Max_tokens auto-continues are uncapped; repeated `length` stops keep producing continuation turns until the model terminates normally
+7. **Empty-stop recovery** — A `stop` turn with no usable output (only thinking, or nothing at all) gets exactly one hidden "nudge" continuation, then gives up. Matches Anthropic's documented "empty responses with `end_turn`" remedy (continuation prompt in a new user message) — retrying an empty response in place doesn't help because the model has already decided it's done.
 8. **Lifecycle exposure** — Emits `pi-retry:started`, `pi-retry:completed`, and `pi-retry:cancelled` on Pi's shared extension event bus with a matching `retryId`, allowing status integrations to suppress intermediate completion signals
 
 The pi's built-in `transform-messages` already strips aborted/errored assistant messages from the LLM context, so the model never sees the failed attempts.
@@ -199,27 +196,17 @@ The pi's built-in `transform-messages` already strips aborted/errored assistant 
 ## Detected Error Patterns
 
 ### Catch-All (Any Error)
-- **Any** assistant message with `stopReason === "error"` is retried by default
+- **Any** assistant message with `stopReason === "error"` is retried — nothing is excluded
 - Unknown provider errors, stream errors, unexpected failures — all handled automatically
-- Only skipped if it matches a known permanent failure (invalid API key, missing model, etc.)
 
-### Non-Retryable (Permanent Failures)
-These are explicitly **not** retried:
-- Invalid API key / invalid authentication
-- API key not found / missing / revoked
-- Model not found / unknown model / no such model / model does not exist
-- Unsupported model
+### Retried Like Everything Else
+These used to be treated as permanent. They are now retried too, because the cause can disappear mid-loop (a key gets refreshed, a quota window rolls over, the context gets compacted):
+- Invalid API key / invalid authentication / revoked or missing key
+- Model not found / unknown model / unsupported model
+- **Quota, session-limit and budget exhaustion** — "You've hit your limit · resets …" (Claude Code, Codex, ChatGPT plans), `insufficient_quota` (OpenAI), "You have exhausted your capacity on this model" (Gemini Code Assist), `free-models-per-day` (OpenRouter), "out of budget" (LiteLLM-style proxies), suspended accounts (Kimi)
+- **Context overflow** — "prompt is too long", "exceeds the context window", and friends
 
-### Non-Retryable (Quota / Session Limit / Budget)
-Exhausted quotas, session limits, and budgets are auto-detected and stop the retry loop (with an explanatory notification), because retrying is pointless until you act or the reset window passes:
-- **Usage / session limits with reset windows** — "You've hit your limit · resets …" and "5-hour limit reached" (Claude Code), "You've hit your usage limit" / "You've exceeded your usage limit" (Codex), "You have hit your ChatGPT usage limit (plus plan)" (ChatGPT subscription caps via the Codex backend, also `usage_limit_reached`)
-- **Plan / billing quotas** — OpenAI `insufficient_quota`, "You exceeded your current quota, please check your plan and billing details" (OpenAI, Gemini — reached only after pi's built-in 429 retry gives up)
-- **Google subscription caps** — "You have exhausted your capacity on this model. Your quota will reset after …" (Gemini Code Assist), "You have reached the quota limit for …" / "You can resume using this model at …" (Antigravity)
-- **Hard allotments** — OpenRouter `free-models-per-day`, Alibaba Coding Plan window quotas "hour/week/month allocated quota exceeded" and free-quota exhaustion "free allocated quota exceeded" (the bare "Allocated quota exceeded" is TPM rate limiting and stays retryable), GitHub Copilot "premium request allowance", z.ai GLM Coding Plan "Usage limit reached for 5 hour" / "no resource package"
-- **Budget exhaustion** — "out of budget", "Budget has been exceeded" (LiteLLM-style proxies), max/spending/monthly limits
-- **Suspended accounts** — "Your account … is suspended" (Kimi `exceeded_current_quota_error`)
-
-Deliberate distinction: plain pay-as-you-go **balance** errors stay retryable — DeepSeek 402 "Insufficient Balance", OpenRouter 402 "Insufficient credits", Kimi "exceeded your current token quota". A mid-session top-up lets the retry loop auto-resume, whereas session limits and budgets do not self-resolve for hours.
+These messages are still labelled `quota` in `/retry status`, so an endless retry loop tells you whether you are waiting on billing or on the network.
 
 ### Max Tokens (stopReason: "length")
 - The model hit its `max_tokens` / output token limit
@@ -324,7 +311,7 @@ Use the status command to diagnose:
 
 ### Want to see what's happening?
 
-The extensions send notifications on retry attempts. Look at the footer status line for retry status updates. Non-retryable errors are logged as errors so you know why we stopped.
+The extensions send notifications on retry attempts. Look at the footer status line for retry status updates, and `/retry status` for the per-category attempt counters and the last error text.
 
 ### Too many retries?
 
@@ -354,9 +341,9 @@ pi install npm:@georgebashi/pi-retry
 
 - Pi's native retry scheduler is disabled while this extension is loaded so native and extension retries cannot interleave; Pi's compaction check still runs normally
 - Error messages remain in the session history (but are invisible to the LLM)
-- May hit the same error repeatedly if the issue is persistent (use `Ctrl+C` to abort)
-- **Warning**: Retrying 400/413 without reducing context may fail repeatedly if the payload is genuinely too large
-- Non-retryable errors (invalid API key, missing model, quota/session-limit/budget exhaustion) are logged but not retried — you'll need to fix the underlying issue, then use `/retry`
+- Every error class is retried, so a permanent-looking failure (invalid API key, exhausted quota, genuinely oversized context) keeps firing at the maximum backoff until the cause is fixed
+- Escape aborts the loop; fresh input or `/new` also stops it
+- **Warning**: Retrying 400/413 without reducing context may fail repeatedly if the payload is genuinely too large — run `/compact`
 
 ---
 
@@ -390,8 +377,7 @@ no built-in marker or identity check for any specific subagent tool.
         ]
       },
       "baseDelayMs": 1000,
-      "maxDelayMs": 10000,
-      "maxRetriesAtMaxDelay": 2
+      "maxDelayMs": 10000
     }
   }
 }

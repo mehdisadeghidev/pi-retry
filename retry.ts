@@ -6,18 +6,13 @@ import {
   hasCreditError,
   hasConnectionError,
   hasRetryableError,
-  isNonRetryableError,
-  isSilencedError,
-  hasQuotaExhaustedError,
   hasMaxTokensStop,
   hasEmptyStop,
-  isContextOverflowError,
   isAssistantMessage,
   getLastAssistantMessage,
   calculateDelay,
   DEFAULT_RETRY_CONFIG,
   loadPiRetrySettings,
-  formatDuration,
   formatRetryCountdown,
   getErrorCategory,
   RETRY_STATUS_KEY,
@@ -49,10 +44,9 @@ const sdkHooksSupported = installRetrySdkHooks();
  * Unified retry extension — retries EVERY error by default.
  *
  * Philosophy: any assistant message with stopReason === "error" is retried
- * with exponential backoff capped by settings, then stops after the configured
- * number of failures at the maximum delay, except a small blacklist of known
- * permanent failures and hard-stop conditions (invalid API key, model not
- * found, quota/session-limit/budget exhaustion, suspended accounts, etc.).
+ * with exponential backoff and retried again forever, with no error blacklist
+ * and no failure cap. Only a user abort (ESC) or a session change stops the
+ * loop; the delay stays pinned at the configured maxDelayMs meanwhile.
  *
  * Specific categories (400/413, credit, connection, stream exhaustion, etc.)
  * are tracked for diagnostics but all share the same retry mechanism.
@@ -243,6 +237,8 @@ export default function (pi: ExtensionAPI) {
   let _notifyFn: ((message: string, level: "info" | "warning" | "error") => void) | null = null;
   let _setStatusFn: ((text: string | undefined) => void) | null = null;
   let retryConfig = { ...DEFAULT_RETRY_CONFIG };
+  // SAFETY: the extension API object is only ever used as a stable WeakMap
+  // / identity key for per-session ownership; pi's own type does not say so.
   const owner = pi as unknown as object;
   // Policy source of each inline controller, so a session reclassified between
   // session_start and before_agent_start never keeps the other policy.
@@ -446,7 +442,7 @@ export default function (pi: ExtensionAPI) {
   // Instead, the handler detects errors and kicks off
   // triggerInvisibleContinue(), which owns the retry loop with backoff
   // sleeps that happen AFTER processEvents returns (outside the agent run).
-  pi.on("agent_end", async (event, ctx) => {
+  pi.on("agent_end", async (_event, ctx) => {
     const binding = getRetrySession(ctx.sessionManager);
     if (binding && binding.owner !== owner) return;
     if (binding?.isChild) {
@@ -512,39 +508,24 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // Context overflow: defer to compaction. Do NOT retry here.
-    //
-    // Retrying the same oversized context before compaction would produce an
-    // uncapped overflow loop. Leave _continueInProgress false so Pi can run
-    // its normal compaction and retry path with the reduced context.
-    if (isContextOverflowError(lastAssistant)) {
-      ctx.ui.notify(
-        "Context overflow — deferring to compaction (auto-retry after compact).",
-        "info",
-      );
-      return;
-    }
-
-    // Catch-all: retry ANY error except known permanent failures
+    // Catch-all: retry EVERY error. Invalid API keys, missing models,
+    // quota/budget exhaustion and context overflow are retried too — pi-core
+    // may compact in parallel, and a hidden turn on the reduced context is
+    // exactly what recovers the turn.
     if (hasRetryableError(lastAssistant)) {
       const errorMsg = lastAssistant.errorMessage || "Unknown error";
       const category = getErrorCategory(errorMsg);
 
       // Pick the right state tracker for diagnostics
       let state: RetryState;
-      let label: string;
       if (category === "400-413") {
         state = state400;
-        label = "400/413";
       } else if (category === "credit") {
         state = stateCredit;
-        label = "Credit";
       } else if (category === "connection") {
         state = stateConnection;
-        label = "Connection";
       } else {
         state = stateOther;
-        label = category === "builtin" ? "Server" : "Other";
       }
 
       if (state.getIsRetrying()) return;
@@ -556,18 +537,6 @@ export default function (pi: ExtensionAPI) {
 
       triggerForContext("retry", ctx);
       return;
-    }
-
-    // Log non-retryable errors so the user knows why we didn't retry
-    // (silenced errors are neither retried nor shown)
-    if (isNonRetryableError(lastAssistant) && !isSilencedError(lastAssistant)) {
-      const errorMsg = lastAssistant.errorMessage || "Unknown error";
-      ctx.ui.notify(
-        hasQuotaExhaustedError(lastAssistant)
-          ? `Quota/limit exhausted — not retrying (fix plan/billing or wait for the reset window, then /retry): ${errorMsg.substring(0, 100)}`
-          : `Non-retryable error (not retried): ${errorMsg.substring(0, 100)}`,
-        "error",
-      );
     }
   });
 
@@ -652,8 +621,7 @@ export default function (pi: ExtensionAPI) {
         status += `  Base delay: ${retryConfig.baseDelayMs}ms\n`;
         status += `  Max delay: ${retryConfig.maxDelayMs}ms\n`;
         status += `  Backoff multiplier: ${retryConfig.multiplier}\n`;
-        status += `  Max-delay failures: ${retryConfig.maxRetriesAtMaxDelay}\n`;
-        status += "  Retry loop: until success, abort, or the max-delay failure limit\n\n";
+        status += "  Retry loop: until success, abort, or session change (uncapped)\n\n";
 
         // Last assistant info
         if (lastAssistant && isAssistantMessage(lastAssistant)) {
@@ -709,29 +677,8 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // Context overflow: don't retry in place — reducing context is required.
-      // Compaction (pi-vcc / /compact) handles it and auto-retries. Retrying
-      // without compaction loops forever on a genuinely oversized payload.
-      if (isContextOverflowError(lastAssistant)) {
-        ctx.ui.notify(
-          "Context overflow — use /compact (or /pi-vcc) to reduce context. Compaction auto-retries.",
-          "info",
-        );
-        return;
-      }
-
-      // Non-retryable errors (permanent failures + quota/budget
-      // exhaustion): report clearly instead of the generic fallback.
-      if (isNonRetryableError(lastAssistant)) {
-        const errorMsg = lastAssistant.errorMessage || "Unknown error";
-        ctx.ui.notify(
-          hasQuotaExhaustedError(lastAssistant)
-            ? `Quota/limit exhausted — resolve the plan/billing issue or wait for the reset window first: ${errorMsg.substring(0, 100)}`
-            : `Non-retryable error (fix the underlying issue first, then /retry): ${errorMsg.substring(0, 100)}`,
-          "warning",
-        );
-        return;
-      }
+      // Every error is retryable, including quota/budget exhaustion and
+      // context overflow — no gate here, the same as the automatic path.
 
       // Auto-detect error type and trigger appropriate retry
       if (has400or413Error(lastAssistant)) {
@@ -910,9 +857,6 @@ export default function (pi: ExtensionAPI) {
       // and answers the nudge with another empty turn is decided, not stalled.
       // Stop after MAX_EMPTY_CONTINUATIONS rather than looping forever.
       let emptyNudges = 0;
-      // Only ordinary retries count toward the maximum-delay cutoff; token
-      // continuations intentionally remain uncapped.
-      let maxDelayRetries = 0;
 
       // Loop until success, abort, or session change.
       while (true) {
@@ -949,10 +893,6 @@ export default function (pi: ExtensionAPI) {
           ? ++retryAttempt
           : Math.max(1, retryAttempt + 1);
         const delay = calculateDelay(delayAttempt, retryConfig);
-        const isMaxDelay = delay >= retryConfig.maxDelayMs;
-        if (hiddenTurnKind === "retry" && isMaxDelay) {
-          maxDelayRetries++;
-        }
 
         // Interruptible sleep with backoff BEFORE the retry attempt. The
         // helper emits the initial frame and replaces it every 100ms instead
@@ -1005,23 +945,12 @@ export default function (pi: ExtensionAPI) {
 
         // The hidden AgentSession turn completed. Both errors and output
         // length stops need another turn; all other terminal states are done.
+        // Loop until success, abort, or session change. No failure cap: an
+        // error that never resolves keeps retrying at the maximum backoff
+        // until the user aborts with ESC or replaces the session.
         hiddenTurnKind = getHiddenTurnKind(myAgent);
         if (!hiddenTurnKind) {
           didRetryComplete = true;
-          return;
-        }
-
-        // Stop ordinary retries after the configured number of failures at
-        // the cap. The failed capped turns have already been delivered; this
-        // check prevents scheduling one more capped request.
-        if (
-          hiddenTurnKind === "retry" &&
-          maxDelayRetries >= retryConfig.maxRetriesAtMaxDelay
-        ) {
-          notifySafely(
-            `Retry failed ${retryConfig.maxRetriesAtMaxDelay} times at the maximum backoff (${formatDuration(retryConfig.maxDelayMs)}); giving up.`,
-            "warning",
-          );
           return;
         }
       }

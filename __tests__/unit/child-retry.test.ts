@@ -22,7 +22,6 @@ function createFixture(
     baseDelayMs: number;
     maxDelayMs: number;
     multiplier: number;
-    maxRetriesAtMaxDelay: number;
     messageFreeRetries?: boolean;
   },
   options: { stubBackoff?: boolean } = {},
@@ -78,7 +77,6 @@ describe("ChildRetryController retry lifecycle", () => {
       baseDelayMs: 10,
       maxDelayMs: 1_000,
       multiplier: 2,
-      maxRetriesAtMaxDelay: 2,
     });
 
     await fixture.controller.handleAgentEnd(fixture.ctx);
@@ -100,7 +98,6 @@ describe("ChildRetryController retry lifecycle", () => {
           baseDelayMs: 250,
           maxDelayMs: 1_000,
           multiplier: 2,
-          maxRetriesAtMaxDelay: 2,
         },
         { stubBackoff: false },
       );
@@ -138,7 +135,6 @@ describe("ChildRetryController retry lifecycle", () => {
       baseDelayMs: 10,
       maxDelayMs: 1_000,
       multiplier: 2,
-      maxRetriesAtMaxDelay: 2,
     });
 
     await fixture.controller.handleAgentEnd(fixture.ctx);
@@ -155,7 +151,6 @@ describe("ChildRetryController retry lifecycle", () => {
       baseDelayMs: 10,
       maxDelayMs: 10,
       multiplier: 2,
-      maxRetriesAtMaxDelay: 2,
     });
 
     for (let index = 0; index < 3; index++) {
@@ -177,7 +172,6 @@ describe("ChildRetryController retry lifecycle", () => {
       baseDelayMs: 10,
       maxDelayMs: 1_000,
       multiplier: 2,
-      maxRetriesAtMaxDelay: 2,
     });
     const automatic = fixture.controller.handleAgentEnd(fixture.ctx);
     const manual = fixture.controller.retryManually(fixture.ctx);
@@ -194,7 +188,6 @@ describe("ChildRetryController message-free retries", () => {
     baseDelayMs: 10,
     maxDelayMs: 1_000,
     multiplier: 2,
-    maxRetriesAtMaxDelay: 2,
     messageFreeRetries: true,
   };
   const failed = { role: "assistant", stopReason: "error", errorMessage: "connection error", content: [] };

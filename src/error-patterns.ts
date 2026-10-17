@@ -1,10 +1,11 @@
 /**
  * Error pattern matching utilities for retry extensions
  *
- * Philosophy: retry EVERY error by default.  The only things we skip are a
- * tiny blacklist of known permanent failures (e.g. invalid API key, model
- * does not exist).  Everything else — 400s, connection issues, credit errors,
- * stream exhaustion, provider hiccups, unknown errors — is retried.
+ * Philosophy: retry EVERY error. There is no blacklist and no cap — invalid
+ * API keys, missing models, quota/budget exhaustion, context overflow,
+ * 400s, connection issues, stream exhaustion, unknown errors are all retried
+ * with backoff until the user aborts. The pattern groups below exist only to
+ * label errors in `/retry status`; none of them gate retrying.
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -15,7 +16,7 @@ export const CONTINUATION_CUSTOM_TYPE = "pi-retry:continue";
 // ── Specific pattern groups (used for categorisation / messaging) ──
 
 const ERROR_400_413_PATTERNS = [
-  /\b4(00|13)\b.*status code/i,
+  /\b4(00|03|13)\b.*status code/i,
   /bad request/i,
   /payload too large/i,
 ];
@@ -67,74 +68,9 @@ const BUILTIN_HANDLED_PATTERNS = [
   /retry\s*delay/i,
 ];
 
-// Context-overflow error patterns. Mirrors pi-core's OVERFLOW_PATTERNS in
-// @earendil-works/pi-ai/dist/utils/overflow.js so that pi-retry defers to
-// compaction exactly when pi-core's _checkCompaction will detect overflow and
-// compact + retry. kept in sync manually — pi-ai is not a direct dependency.
-//
-// Why these are NOT retried by pi-retry: a hidden retry turn would re-send
-// the same oversized context, so it overflows again → infinite loop
-// (pi-retry's loop is uncapped for errors). pi-core instead compacts and
-// retries once via agent.continue(); with static compaction (pi-vcc) that
-// reliably reduces context, so the single retry succeeds.
-const OVERFLOW_ERROR_PATTERNS = [
-  /prompt is too long/i,
-  /request_too_large/i,
-  /input is too long for requested model/i,
-  /exceeds the context window/i,
-  /exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))/i,
-  /input token count.*exceeds the maximum/i,
-  /maximum prompt length is \d+/i,
-  /reduce the length of the messages/i,
-  /maximum context length is \d+ tokens/i,
-  /exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?/i,
-  /input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)/i,
-  /exceeds the limit of \d+/i,
-  /exceeds the available context size/i,
-  /greater than the context length/i,
-  /context window exceeds limit/i,
-  /exceeded model token limit/i,
-  /too large for model with \d+ maximum context length/i,
-  /model_context_window_exceeded/i,
-  /prompt too long; exceeded (?:max )?context length/i,
-  /context[_ ]length[_ ]exceeded/i,
-  /too many tokens/i,
-  /token limit exceeded/i,
-  /^4(?:00|13)\s*(?:status code)?\s*\(no body\)/i,
-];
-
-// Patterns that look like overflow but are actually rate limiting / throttling.
-// Mirrors pi-core's NON_OVERFLOW_PATTERNS. Excluded from overflow detection so
-// throttling errors are still retried (they are not context-size problems).
-const NON_OVERFLOW_PATTERNS = [
-  /^(Throttling error|Service unavailable):/i,
-  /rate limit/i,
-  /too many requests/i,
-];
-
-// ── Blacklist: errors that are truly permanent and should NOT be retried ──
-
-const NON_RETRYABLE_PATTERNS = [
-  /invalid\s*api\s*key/i,
-  /invalid\s*authentication/i,
-  /api\s*key\s*(not\s*found|missing|revoked)/i,
-  /model\s*not\s*found/i,
-  /unknown\s*model/i,
-  /no\s*such\s*model/i,
-  /model\s*does\s*not\s*exist/i,
-  /unsupported\s*model/i,
-  /cannot continue from message role/i,
-];
-
-// Errors that are non-retryable AND should be silently ignored (no notification)
-const SILENCED_PATTERNS = [
-  /cannot continue from message role/i,
-];
-
-// Quota / session-limit / budget exhaustion — hard stops:
-// retrying is pointless until the user upgrades, tops up a budget, or waits
-// out a reset window measured in hours/days. Distinct from per-minute rate
-// limits and pay-as-you-go balance errors, which stay retryable.
+// Quota / session-limit / budget exhaustion — labelled in `/retry status` so
+// a user staring at an endless retry loop can see the cause is billing, not
+// the network. Retried like every other error.
 //
 // Evidence (real provider messages):
 // - Claude Code:  "You've hit your limit · resets 4pm (Asia/Kuala_Lumpur)"
@@ -176,7 +112,7 @@ const SILENCED_PATTERNS = [
 // Balance" and 429 "Rate Limit Reached" (concurrency), Kimi TPD org limits
 // and "exceeded your current token quota" (balance), Alibaba "Allocated quota
 // exceeded" (429 Throttling.AllocationQuota — TPM rate limiting, recovers in
-// minutes). See the note on hasQuotaExhaustedError below.
+// minutes). Retried like every other error.
 export const QUOTA_EXHAUSTED_PATTERNS = [
   // Session / usage limits with reset windows (Claude, Codex, ChatGPT plans)
   /hit your (?:[a-z]+ )?usage limit/i, // "…hit your usage limit", "…hit your ChatGPT usage limit (plus plan)" — the optional word is the provider name; "hit your rate limit" intentionally NOT matched (burst limit stays retryable)
@@ -222,7 +158,9 @@ export const QUOTA_EXHAUSTED_PATTERNS = [
 
 // ── Type guard ──
 
-export function isAssistantMessage(message: AgentMessage): message is Extract<AgentMessage, { role: "assistant" }> {
+export function isAssistantMessage(
+  message: AgentMessage,
+): message is Extract<AgentMessage, { role: "assistant" }> {
   return message.role === "assistant";
 }
 
@@ -231,99 +169,50 @@ export function isAssistantMessage(message: AgentMessage): message is Extract<Ag
 export function has400or413Error(message: AgentMessage): boolean {
   if (!isAssistantMessage(message)) return false;
   if (message.stopReason !== "error" || !message.errorMessage) return false;
-  return ERROR_400_413_PATTERNS.some(p => p.test(message.errorMessage!));
+  return ERROR_400_413_PATTERNS.some((p) => p.test(message.errorMessage!));
 }
 
 export function hasCreditError(message: AgentMessage): boolean {
   if (!isAssistantMessage(message)) return false;
   if (message.stopReason !== "error" || !message.errorMessage) return false;
-  return CREDIT_ERROR_PATTERNS.some(p => p.test(message.errorMessage!));
+  return CREDIT_ERROR_PATTERNS.some((p) => p.test(message.errorMessage!));
 }
 
 export function hasConnectionError(message: AgentMessage): boolean {
   if (!isAssistantMessage(message)) return false;
   if (message.stopReason !== "error" || !message.errorMessage) return false;
-  return CONNECTION_ERROR_PATTERNS.some(p => p.test(message.errorMessage!));
-}
-
-/**
- * Returns true for an error assistant message whose errorMessage indicates a
- * context-overflow (input exceeded the model's context window).
- *
- * Mirrors pi-core's isContextOverflow Case 1 (error-message patterns). The
- * silent-overflow cases (stopReason "stop"/"length") are not errors and are
- * never seen here — pi-core handles those in _checkCompaction directly.
- *
- * Callers should treat a true result as "defer to compaction, do NOT retry" —
- * see OVERFLOW_ERROR_PATTERNS for rationale.
- */
-export function isContextOverflowError(message: AgentMessage): boolean {
-  if (!isAssistantMessage(message)) return false;
-  if (message.stopReason !== "error" || !message.errorMessage) return false;
-  if (NON_OVERFLOW_PATTERNS.some(p => p.test(message.errorMessage!))) return false;
-  return OVERFLOW_ERROR_PATTERNS.some(p => p.test(message.errorMessage!));
+  return CONNECTION_ERROR_PATTERNS.some((p) => p.test(message.errorMessage!));
 }
 
 // ── Universal retry check ──
 
 /**
- * Returns true for ANY assistant message with stopReason === "error"
- * except a tiny blacklist of known permanent failures.
+ * Returns true for ANY assistant message with stopReason === "error".
+ *
+ * Nothing is excluded: invalid API keys, missing models, quota/budget
+ * exhaustion and context overflow are retried like every other error. The
+ * caller is only allowed to stop on a user abort or a session change.
  */
 export function hasRetryableError(message: AgentMessage): boolean {
   if (!isAssistantMessage(message)) return false;
-  if (message.stopReason !== "error" || !message.errorMessage) return false;
-  return !isNonRetryableError(message);
-}
-
-/**
- * Returns true only for known permanent failures (invalid API key, missing model, etc.)
- */
-export function isNonRetryableError(message: AgentMessage): boolean {
-  if (!isAssistantMessage(message)) return false;
-  if (message.stopReason !== "error" || !message.errorMessage) return false;
-  return (
-    NON_RETRYABLE_PATTERNS.some(p => p.test(message.errorMessage!)) ||
-    QUOTA_EXHAUSTED_PATTERNS.some(p => p.test(message.errorMessage!))
-  );
-}
-
-/**
- * Returns true for quota / session-limit / budget exhaustion errors where
- * retrying is pointless until the user acts (upgrade, top up a budget) or a
- * long reset window passes (hours/days). Treated as non-retryable.
- *
- * Deliberately NOT matched: per-minute rate limits (429s) and pay-as-you-go
- * balance errors (DeepSeek "Insufficient Balance", OpenRouter "Insufficient
- * credits", Kimi "exceeded your current token quota") — those stay retryable
- * so a mid-session top-up auto-resumes.
- */
-export function hasQuotaExhaustedError(message: AgentMessage): boolean {
-  if (!isAssistantMessage(message)) return false;
-  if (message.stopReason !== "error" || !message.errorMessage) return false;
-  return QUOTA_EXHAUSTED_PATTERNS.some(p => p.test(message.errorMessage!));
-}
-
-/**
- * Returns true for errors that are non-retryable and should be silently
- * ignored (no UI notification). These are provider-level refusals that
- * the user cannot act on and that would only add noise.
- */
-export function isSilencedError(message: AgentMessage): boolean {
-  if (!isAssistantMessage(message)) return false;
-  if (message.stopReason !== "error" || !message.errorMessage) return false;
-  return SILENCED_PATTERNS.some(p => p.test(message.errorMessage!));
+  return message.stopReason === "error" && Boolean(message.errorMessage);
 }
 
 // ── Categorisation (for UI messages) ──
 
-export function getErrorCategory(errorMessage: string): '400-413' | 'credit' | 'connection' | 'builtin' | 'quota' | 'other' {
-  if (QUOTA_EXHAUSTED_PATTERNS.some(p => p.test(errorMessage))) return 'quota';
-  if (ERROR_400_413_PATTERNS.some(p => p.test(errorMessage))) return '400-413';
-  if (CREDIT_ERROR_PATTERNS.some(p => p.test(errorMessage))) return 'credit';
-  if (CONNECTION_ERROR_PATTERNS.some(p => p.test(errorMessage))) return 'connection';
-  if (BUILTIN_HANDLED_PATTERNS.some(p => p.test(errorMessage))) return 'builtin';
-  return 'other';
+export function getErrorCategory(
+  errorMessage: string,
+): "400-413" | "credit" | "connection" | "builtin" | "quota" | "other" {
+  if (QUOTA_EXHAUSTED_PATTERNS.some((p) => p.test(errorMessage)))
+    return "quota";
+  if (ERROR_400_413_PATTERNS.some((p) => p.test(errorMessage)))
+    return "400-413";
+  if (CREDIT_ERROR_PATTERNS.some((p) => p.test(errorMessage))) return "credit";
+  if (CONNECTION_ERROR_PATTERNS.some((p) => p.test(errorMessage)))
+    return "connection";
+  if (BUILTIN_HANDLED_PATTERNS.some((p) => p.test(errorMessage)))
+    return "builtin";
+  return "other";
 }
 
 // ── Max tokens (not an error — continuation) ──
@@ -360,7 +249,9 @@ export function hasEmptyStop(message: AgentMessage): boolean {
     const candidate = block as { type?: unknown; text?: unknown };
     if (candidate.type === "toolCall") return true;
     if (candidate.type === "text") {
-      return typeof candidate.text === "string" && candidate.text.trim().length > 0;
+      return (
+        typeof candidate.text === "string" && candidate.text.trim().length > 0
+      );
     }
     return false;
   });
@@ -368,4 +259,4 @@ export function hasEmptyStop(message: AgentMessage): boolean {
 }
 
 // Re-export getLastAssistantMessage for convenience
-export { getLastAssistantMessage } from './retry-logic.js';
+export { getLastAssistantMessage } from "./retry-logic.js";

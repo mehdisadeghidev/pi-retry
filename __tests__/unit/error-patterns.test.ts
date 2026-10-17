@@ -9,12 +9,8 @@ import {
   hasCreditError,
   hasConnectionError,
   hasRetryableError,
-  isNonRetryableError,
-  isSilencedError,
-  hasQuotaExhaustedError,
   hasMaxTokensStop,
   hasEmptyStop,
-  isContextOverflowError,
   getErrorCategory,
   CONNECTION_ERROR_PATTERNS,
 } from '../../src/error-patterns.js';
@@ -169,79 +165,6 @@ describe('hasConnectionError', () => {
   });
 });
 
-describe('isContextOverflowError', () => {
-  const createAssistantError = (errorMessage: string): AgentMessage =>
-    ({ role: 'assistant', stopReason: 'error', errorMessage, content: [] } as unknown as AgentMessage);
-
-  // Mirrors pi-core's isContextOverflow Case 1 patterns. These are the errors
-  // pi-retry must NOT retry (defer to compaction) — see error-patterns.ts.
-  const overflowCases = [
-    'prompt is too long: 213462 tokens > 200000 maximum',
-    'request_too_large: Request exceeds the maximum size',
-    'Your input exceeds the context window of this model',
-    'Requested token count exceeds the model\'s maximum context length of 131072 tokens',
-    'The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)',
-    'This model\'s maximum prompt length is 131072 but the request contains 537812 tokens',
-    'Please reduce the length of the messages or completion',
-    'This endpoint\'s maximum context length is 131072 tokens. However, you requested about 265330 tokens',
-    'Input length (265330) exceeds model\'s maximum context length (262144).',
-    'prompt token count of 265330 exceeds the limit of 262144',
-    'invalid params, context window exceeds limit',
-    'Your request exceeded model token limit: 200000 (requested: 213462)',
-    'Prompt contains 213462 tokens ... too large for model with 200000 maximum context length',
-    'model_context_window_exceeded',
-    'prompt too long; exceeded max context length by 13462 tokens',
-    'context_length_exceeded',
-    'too many tokens',
-    'token limit exceeded',
-    '400 (no body)',
-    '413 (no body)',
-  ];
-
-  overflowCases.forEach((pattern) => {
-    it(`detects overflow "${pattern.slice(0, 50)}"`, () => {
-      const msg = createAssistantError(pattern);
-      expect(isContextOverflowError(msg)).toBe(true);
-    });
-  });
-
-  // Throttling / rate-limit strings that contain overflow-looking substrings
-  // must NOT be classified as overflow — they are retried normally.
-  const nonOverflowCases = [
-    'Throttling error: Too many tokens, please wait before trying again.',
-    'Service unavailable: temporarily offline',
-    'rate limit exceeded',
-    'Too many requests — slow down',
-  ];
-
-  nonOverflowCases.forEach((pattern) => {
-    it(`does not classify throttling/rate-limit as overflow: "${pattern}"`, () => {
-      const msg = createAssistantError(pattern);
-      expect(isContextOverflowError(msg)).toBe(false);
-    });
-  });
-
-  it('returns false for non-overflow errors', () => {
-    expect(isContextOverflowError(createAssistantError('Connection error'))).toBe(false);
-    expect(isContextOverflowError(createAssistantError('500 Internal Server Error'))).toBe(false);
-    expect(isContextOverflowError(createAssistantError('Not enough credits'))).toBe(false);
-  });
-
-  it('returns false for non-error messages', () => {
-    const msg = { role: 'assistant', stopReason: 'stop', content: [] } as unknown as AgentMessage;
-    expect(isContextOverflowError(msg)).toBe(false);
-  });
-
-  it('returns false for messages without errorMessage', () => {
-    const msg = { role: 'assistant', stopReason: 'error', content: [] } as unknown as AgentMessage;
-    expect(isContextOverflowError(msg)).toBe(false);
-  });
-
-  it('returns false for user messages', () => {
-    const msg = { role: 'user', content: [{ type: 'text', text: 'test' }] } as unknown as AgentMessage;
-    expect(isContextOverflowError(msg)).toBe(false);
-  });
-});
 
 describe('hasRetryableError', () => {
   const createAssistantError = (errorMessage: string): AgentMessage =>
@@ -257,6 +180,19 @@ describe('hasRetryableError', () => {
     expect(hasRetryableError(msg)).toBe(true);
   });
 
+  // Force-retry: no error class is excluded anymore.
+  it.each([
+    'Invalid API key provided',
+    'Model not found: gpt-99',
+    'Unknown model',
+    'Cannot continue from message role: assistant',
+    "You've hit your limit · resets 4pm",
+    'out of budget',
+    'prompt is too long: 250000 tokens > 200000 maximum',
+  ])('returns true for %j', errorMessage => {
+    expect(hasRetryableError(createAssistantError(errorMessage))).toBe(true);
+  });
+
   it('returns false for non-error messages', () => {
     const msg = { role: 'assistant', stopReason: 'endTurn', content: [] } as unknown as AgentMessage;
     expect(hasRetryableError(msg)).toBe(false);
@@ -268,65 +204,7 @@ describe('hasRetryableError', () => {
   });
 });
 
-describe('isNonRetryableError', () => {
-  const createAssistantError = (errorMessage: string): AgentMessage =>
-    ({ role: 'assistant', stopReason: 'error', errorMessage, content: [] } as unknown as AgentMessage);
 
-  it('detects invalid api key', () => {
-    const msg = createAssistantError('Invalid API key provided');
-    expect(isNonRetryableError(msg)).toBe(true);
-  });
-
-  it('detects model not found', () => {
-    const msg = createAssistantError('Model not found: gpt-99');
-    expect(isNonRetryableError(msg)).toBe(true);
-  });
-
-  it('detects unknown model', () => {
-    const msg = createAssistantError('Unknown model');
-    expect(isNonRetryableError(msg)).toBe(true);
-  });
-
-  it('detects "cannot continue from message role" errors', () => {
-    const msg = createAssistantError('Cannot continue from message role: assistant');
-    expect(isNonRetryableError(msg)).toBe(true);
-  });
-
-  it('returns false for retryable errors', () => {
-    const msg = createAssistantError('Connection error');
-    expect(isNonRetryableError(msg)).toBe(false);
-  });
-
-  it('returns false for non-error messages', () => {
-    const msg = { role: 'assistant', stopReason: 'endTurn', content: [] } as unknown as AgentMessage;
-    expect(isNonRetryableError(msg)).toBe(false);
-  });
-});
-
-describe('isSilencedError', () => {
-  const createAssistantError = (errorMessage: string): AgentMessage =>
-    ({ role: 'assistant', stopReason: 'error', errorMessage, content: [] } as unknown as AgentMessage);
-
-  it('silences "cannot continue from message role" errors', () => {
-    const msg = createAssistantError('Cannot continue from message role: assistant');
-    expect(isSilencedError(msg)).toBe(true);
-  });
-
-  it('does not silence invalid API key errors', () => {
-    const msg = createAssistantError('Invalid API key provided');
-    expect(isSilencedError(msg)).toBe(false);
-  });
-
-  it('does not silence model not found errors', () => {
-    const msg = createAssistantError('Model not found: gpt-99');
-    expect(isSilencedError(msg)).toBe(false);
-  });
-
-  it('returns false for non-error messages', () => {
-    const msg = { role: 'assistant', stopReason: 'endTurn', content: [] } as unknown as AgentMessage;
-    expect(isSilencedError(msg)).toBe(false);
-  });
-});
 
 describe('getErrorCategory', () => {
   it('categorizes 400/413 errors', () => {
@@ -414,101 +292,14 @@ describe('hasMaxTokensStop', () => {
   });
 });
 
-describe('hasQuotaExhaustedError', () => {
+
+describe('quota errors are retried and labelled', () => {
   const createAssistantError = (errorMessage: string): AgentMessage =>
     ({ role: 'assistant', stopReason: 'error', errorMessage, content: [] } as unknown as AgentMessage);
 
-  it('detects Claude Code session / weekly limit variants', () => {
-    expect(hasQuotaExhaustedError(createAssistantError("You've hit your limit · resets 4pm (Asia/Kuala_Lumpur)"))).toBe(true);
-    expect(hasQuotaExhaustedError(createAssistantError("You've hit your limit for Claude messages. Limits will reset at 3:00 AM."))).toBe(true);
-    expect(hasQuotaExhaustedError(createAssistantError('Claude usage limit reached. Your limit will reset at 3pm'))).toBe(true);
-    expect(hasQuotaExhaustedError(createAssistantError('5-hour limit reached · resets 12pm'))).toBe(true);
-  });
-
-  it('detects Codex / ChatGPT plan limits', () => {
-    expect(hasQuotaExhaustedError(createAssistantError("You've hit your usage limit. Upgrade to Plus"))).toBe(true);
-    expect(hasQuotaExhaustedError(createAssistantError("You've exceeded your usage limit."))).toBe(true);
-  });
-
-  it('detects ChatGPT plan-cap messages (provider name between "your" and "usage limit")', () => {
-    // The screenshot case: backed off forever despite a multi-day reset window
-    expect(hasQuotaExhaustedError(createAssistantError('You have hit your ChatGPT usage limit (plus plan). Try again in ~5330 min.'))).toBe(true);
-    expect(hasQuotaExhaustedError(createAssistantError('You have hit your ChatGPT usage limit (go plan). Try again in ~81 min.'))).toBe(true);
-    expect(hasQuotaExhaustedError(createAssistantError("You've hit your usage limit, try again in 4 days 2 hours 46 minutes"))).toBe(true);
-  });
-
-  it('detects Codex backend 429 usage_limit_reached', () => {
-    expect(hasQuotaExhaustedError(createAssistantError('HTTP 429: The usage limit has been reached (error.type=usage_limit_reached)'))).toBe(true);
-  });
-
-  it('detects Google subscription caps (Gemini Code Assist / Antigravity)', () => {
-    expect(hasQuotaExhaustedError(createAssistantError('You have exhausted your capacity on this model. Your quota will reset after 8h44m7s.'))).toBe(true);
-    expect(hasQuotaExhaustedError(createAssistantError('Model quota limit exceeded. You have reached the quota limit for Claude Sonnet 4.5 (Thinking). You can resume using this model at 1/28/2026, 9:20:40 AM.'))).toBe(true);
-    expect(hasQuotaExhaustedError(createAssistantError('You can resume using this model at 2/15/2026, 11:19:09 PM.'))).toBe(true);
-  });
-
-  it('detects z.ai GLM coding plan window exhaustion', () => {
-    expect(hasQuotaExhaustedError(createAssistantError('HTTP 429: Usage limit reached for 5 hour. Your limit will reset at 2026-05-30 22:00:45'))).toBe(true);
-    expect(hasQuotaExhaustedError(createAssistantError('HTTP 429: {"error":{"code":"1113","message":"Insufficient balance or no resource package. Please recharge."}}'))).toBe(true);
-  });
-
-  it('detects OpenAI platform insufficient_quota', () => {
-    expect(hasQuotaExhaustedError(createAssistantError('You exceeded your current quota, please check your plan and billing details. For more information on this error, read the docs: https://platform.openai.com/docs/guides/error-codes/api-errors. (insufficient_quota)'))).toBe(true);
-  });
-
-  it('detects Gemini plan quota (reaches us after built-in 429 retries give up)', () => {
-    expect(hasQuotaExhaustedError(createAssistantError('You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.dev/rate-limit.'))).toBe(true);
-  });
-
-  it('detects OpenRouter free-tier daily pool', () => {
-    expect(hasQuotaExhaustedError(createAssistantError('Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day'))).toBe(true);
-  });
-
-  it('keeps Alibaba TPM rate limiting retryable (not a hard quota)', () => {
-    const msg = createAssistantError('Allocated quota exceeded, please increase your quota limit');
-    expect(hasQuotaExhaustedError(msg)).toBe(false);
-    expect(isNonRetryableError(msg)).toBe(false);
-    expect(hasRetryableError(msg)).toBe(true);
-  });
-
-  it('detects Alibaba hard quota variants (Coding Plan windows / free quota)', () => {
-    expect(hasQuotaExhaustedError(createAssistantError('hour allocated quota exceeded'))).toBe(true);
-    expect(hasQuotaExhaustedError(createAssistantError('week allocated quota exceeded'))).toBe(true);
-    expect(hasQuotaExhaustedError(createAssistantError('month allocated quota exceeded'))).toBe(true);
-    expect(hasQuotaExhaustedError(createAssistantError('free allocated quota exceeded'))).toBe(true);
-  });
-
-  it('detects GitHub Copilot premium allowance exhaustion', () => {
-    expect(hasQuotaExhaustedError(createAssistantError('You have exceeded your premium request allowance.'))).toBe(true);
-  });
-
-  it('detects budget exhaustion (LiteLLM-style proxies)', () => {
-    expect(hasQuotaExhaustedError(createAssistantError('Budget has been exceeded! Current cost: 0.5, Max budget: 0.4'))).toBe(true);
-    expect(hasQuotaExhaustedError(createAssistantError('out of budget'))).toBe(true);
-  });
-
-  it('detects suspended accounts (Kimi exceeded_current_quota_error)', () => {
-    expect(hasQuotaExhaustedError(createAssistantError('Your account org-123<ak-xyz> is suspended, please check your plan and billing details'))).toBe(true);
-  });
-
-  it('returns false for non-error messages', () => {
-    const msg = { role: 'assistant', stopReason: 'endTurn', content: [] } as unknown as AgentMessage;
-    expect(hasQuotaExhaustedError(msg)).toBe(false);
-  });
-});
-
-describe('quota errors are not retried', () => {
-  const createAssistantError = (errorMessage: string): AgentMessage =>
-    ({ role: 'assistant', stopReason: 'error', errorMessage, content: [] } as unknown as AgentMessage);
-
-  it('hasRetryableError returns false for quota errors', () => {
-    expect(hasRetryableError(createAssistantError("You've hit your limit · resets 4pm"))).toBe(false);
-    expect(hasRetryableError(createAssistantError('out of budget'))).toBe(false);
-  });
-
-  it('isNonRetryableError returns true for quota errors', () => {
-    expect(isNonRetryableError(createAssistantError("You've hit your usage limit. Upgrade to Plus"))).toBe(true);
-    expect(isNonRetryableError(createAssistantError('Budget has been exceeded! Current cost: 0.5, Max budget: 0.4'))).toBe(true);
+  it('hasRetryableError returns true for quota errors', () => {
+    expect(hasRetryableError(createAssistantError("You've hit your limit · resets 4pm"))).toBe(true);
+    expect(hasRetryableError(createAssistantError('out of budget'))).toBe(true);
   });
 
   it('getErrorCategory returns quota (checked before builtin rate-limit)', () => {
@@ -522,46 +313,39 @@ describe('quota patterns do not false-positive on transient/balance errors', () 
   const createAssistantError = (errorMessage: string): AgentMessage =>
     ({ role: 'assistant', stopReason: 'error', errorMessage, content: [] } as unknown as AgentMessage);
 
+  const expectNotQuota = (messages: string[]) => {
+    for (const text of messages) {
+      expect(getErrorCategory(text)).not.toBe('quota');
+      expect(hasRetryableError(createAssistantError(text))).toBe(true);
+    }
+  };
+
   it('Anthropic transient rate-limit messages stay retryable', () => {
-    const msg1 = createAssistantError("This request would exceed your account's rate limit");
-    const msg2 = createAssistantError('Server is temporarily limiting requests (not your usage limit) · Rate limited');
-    expect(hasQuotaExhaustedError(msg1)).toBe(false);
-    expect(hasRetryableError(msg1)).toBe(true);
-    expect(hasQuotaExhaustedError(msg2)).toBe(false);
-    expect(hasRetryableError(msg2)).toBe(true);
+    expectNotQuota([
+      "This request would exceed your account's rate limit",
+      'Server is temporarily limiting requests (not your usage limit) · Rate limited',
+    ]);
   });
 
   it('per-minute rate limits stay retryable', () => {
-    const msg1 = createAssistantError('Rate limit exceeded');
-    const msg2 = createAssistantError('Rate Limit Reached'); // DeepSeek 429
-    const msg3 = createAssistantError('Your account org<ak> request reached organization TPD rate limit,current:10, limit:5'); // Kimi TPD
-    const msg4 = createAssistantError("You've hit your rate limit — slow down and try again shortly"); // burst RPM wording, not plan exhaustion
-    expect(hasQuotaExhaustedError(msg1)).toBe(false);
-    expect(hasRetryableError(msg1)).toBe(true);
-    expect(hasQuotaExhaustedError(msg2)).toBe(false);
-    expect(hasRetryableError(msg2)).toBe(true);
-    expect(hasQuotaExhaustedError(msg3)).toBe(false);
-    expect(hasRetryableError(msg3)).toBe(true);
-    expect(hasQuotaExhaustedError(msg4)).toBe(false);
-    expect(hasRetryableError(msg4)).toBe(true);
+    expectNotQuota([
+      'Rate limit exceeded',
+      'Rate Limit Reached', // DeepSeek 429
+      'Your account org<ak> request reached organization TPD rate limit,current:10, limit:5', // Kimi TPD
+      "You've hit your rate limit — slow down and try again shortly", // burst RPM wording, not plan exhaustion
+    ]);
   });
 
   it('pay-as-you-go balance errors stay retryable (top-up auto-resume)', () => {
-    const msg1 = createAssistantError('Insufficient Balance'); // DeepSeek 402
-    const msg2 = createAssistantError('Insufficient credits. To increase, visit https://openrouter.ai/settings/credits and add more credits'); // OpenRouter 402
-    const msg3 = createAssistantError('You exceeded your current token quota: <org-1> 100, please check your account balance'); // Kimi balance quota
-    expect(hasQuotaExhaustedError(msg1)).toBe(false);
-    expect(hasRetryableError(msg1)).toBe(true);
-    expect(hasQuotaExhaustedError(msg2)).toBe(false);
-    expect(hasRetryableError(msg2)).toBe(true);
-    expect(hasQuotaExhaustedError(msg3)).toBe(false);
-    expect(hasRetryableError(msg3)).toBe(true);
+    expectNotQuota([
+      'Insufficient Balance', // DeepSeek 402
+      'Insufficient credits. To increase, visit https://openrouter.ai/settings/credits and add more credits', // OpenRouter 402
+      'You exceeded your current token quota: <org-1> 100, please check your account balance', // Kimi balance quota
+    ]);
   });
 
   it('engine overloaded stays retryable (Kimi engine_overloaded_error)', () => {
-    const msg = createAssistantError('The engine is currently overloaded, please try again later');
-    expect(hasQuotaExhaustedError(msg)).toBe(false);
-    expect(hasRetryableError(msg)).toBe(true);
+    expectNotQuota(['The engine is currently overloaded, please try again later']);
   });
 });
 
